@@ -74,6 +74,18 @@ async def tg_request(env, method: str, payload: dict | None = None) -> dict:
         return js_data.to_py()
     return js_data
 
+async def set_message_reaction(env, chat_id: int, message_id: int, emoji: str = "👌"):
+    """给消息打上 Reaction 表情反馈"""
+    try:
+        await tg_request(env, "setMessageReaction", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": [{"type": "emoji", "emoji": emoji}],
+            "is_big": False
+        })
+    except Exception as e:
+        print(f"Reaction error: {e}")
+
 async def get_user_dc(env, user_id: int) -> str:
     try:
         res = await tg_request(env, "getUserProfilePhotos", {"user_id": user_id, "limit": 1})
@@ -88,6 +100,16 @@ async def get_user_dc(env, user_id: int) -> str:
     except Exception as e:
         print(f"Error getting user DC: {e}")
     return "null"
+
+async def check_rate_limit(env, user_id: int) -> bool:
+    """10秒内最多允许发送 5 条消息"""
+    key = f"ratelimit:{user_id}"
+    val = await env.pmbot_captcha.get(key)
+    count = int(val) if val else 0
+    if count >= 5:
+        return False
+    await env.pmbot_captcha.put(key, str(count + 1), expirationTtl=10)
+    return True
 
 async def send_captcha(env, chat_id: int, original_msg_id: int | None = None):
     code, art = generate_captcha()
@@ -110,7 +132,7 @@ async def send_captcha(env, chat_id: int, original_msg_id: int | None = None):
         "captcha_msg_id": captcha_msg_id,
         "original_msg_id": original_msg_id
     }
-    # 5 minutes expiration
+    # 5分钟超时
     await env.pmbot_captcha.put(f"captcha_pending:{chat_id}", json.dumps(pending_data), expirationTtl=300)
 
 async def handle_user_verified_banner(env, user: dict, original_msg_id: int | None = None):
@@ -132,15 +154,15 @@ async def handle_user_verified_banner(env, user: dict, original_msg_id: int | No
         f"<b>DC:</b> {dc_display}"
     )
     
-    # Send banner to Admin
     admin_id = int(env.ADMIN_UID)
+    # 1. 向管理员发送名片
     await tg_request(env, "sendMessage", {
         "chat_id": admin_id,
         "text": banner_text,
         "parse_mode": "HTML"
     })
     
-    # If there was an original message sent before verification, forward it now
+    # 2. 如果验证前有留存消息，直接转发给管理员
     if original_msg_id:
         fwd_res = await tg_request(env, "forwardMessage", {
             "chat_id": admin_id,
@@ -149,7 +171,9 @@ async def handle_user_verified_banner(env, user: dict, original_msg_id: int | No
         })
         if fwd_res.get("ok"):
             admin_msg_id = fwd_res["result"]["message_id"]
-            # Save mapping (30 days TTL)
+            # 给用户的原消息打上 Reaction 反馈
+            await set_message_reaction(env, user_id, original_msg_id, "👌")
+            # 记录双向映射 (30天 TTL)
             await env.pmbot_captcha.put(
                 f"a2u:{admin_msg_id}",
                 json.dumps({"user_id": user_id, "user_msg_id": original_msg_id}),
@@ -162,12 +186,11 @@ async def handle_user_verified_banner(env, user: dict, original_msg_id: int | No
             )
 
 async def on_fetch(request, env):
-    # Only allow POST (for Telegram Webhook)
     if request.method != "POST":
-        return Response("TG_PMbot (Cloudflare Python Worker) is running.", headers={"Content-Type": "text/plain;charset=utf-8"})
+        return Response("TG_PMbot is running.", headers={"Content-Type": "text/plain;charset=utf-8"})
     
     try:
-        # Check Telegram Webhook secret token if configured
+        # 验证 Webhook Secret Token
         webhook_secret = getattr(env, "TG_WEBHOOK_SECRET", None)
         if webhook_secret:
             incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
@@ -187,33 +210,203 @@ async def on_fetch(request, env):
         sender_id = from_user.get("id")
         chat_id = message.get("chat", {}).get("id")
         msg_id = message.get("message_id")
-        text = message.get("text", "")
+        text = message.get("text", "") or ""
         admin_id = int(env.ADMIN_UID)
         
         if not sender_id or not chat_id:
             return Response("OK")
         
-        # -------------------------------------------------------------
-        # 1. MESSAGE FROM ADMIN (Reply to user)
-        # -------------------------------------------------------------
+        # =============================================================
+        # 1. 来自管理员的消息 (管理命令或回复用户)
+        # =============================================================
         if sender_id == admin_id:
             reply_to = message.get("reply_to_message")
-            if not reply_to:
-                if text in ["/start", "/help"]:
+            tokens = text.strip().split()
+            cmd = tokens[0].lower() if tokens else ""
+
+            # ----- 命令：/start 或 /help -----
+            if cmd in ["/start", "/help"]:
+                help_text = (
+                    "👑 <b>管理员控制面板</b>\n\n"
+                    "• <b>回复消息</b>：直接【回复】某条用户的转发消息，内容将无引用转发给对方，并保留回复引用。\n"
+                    "• <b>封禁用户</b>：\n"
+                    "  - 回复消息：<code>/ban [理由]</code>\n"
+                    "  - 指定UID：<code>/ban &lt;UID&gt; [理由]</code>\n"
+                    "• <b>解封用户</b>：\n"
+                    "  - 回复消息：<code>/unban</code>\n"
+                    "  - 指定UID：<code>/unban &lt;UID&gt;</code>\n"
+                    "• <b>查看名片</b>：回复消息发送 <code>/info</code> 重新调取该用户的资料与DC。"
+                )
+                await tg_request(env, "sendMessage", {
+                    "chat_id": admin_id,
+                    "text": help_text,
+                    "parse_mode": "HTML"
+                })
+                return Response("OK")
+
+            # ----- 命令：/ban (封禁) -----
+            if cmd == "/ban":
+                target_user_id = None
+                reason = ""
+
+                if reply_to:
+                    # 回复消息封禁
+                    admin_replied_msg_id = reply_to.get("message_id")
+                    mapping_raw = await env.pmbot_captcha.get(f"a2u:{admin_replied_msg_id}")
+                    if mapping_raw:
+                        target_user_id = json.loads(mapping_raw)["user_id"]
+                        if len(tokens) > 1:
+                            reason = " ".join(tokens[1:]).strip()
+                elif len(tokens) > 1 and tokens[1].isdigit():
+                    # /ban <UID> [理由]
+                    target_user_id = int(tokens[1])
+                    if len(tokens) > 2:
+                        reason = " ".join(tokens[2:]).strip()
+
+                if not target_user_id:
                     await tg_request(env, "sendMessage", {
                         "chat_id": admin_id,
-                        "text": "👑 <b>管理员控制面板</b>\n\n• 直接【回复】用户的某条转发消息，Bot 将自动无引用转发给该用户，并携带回复关联。",
-                        "parse_mode": "HTML"
+                        "text": "💡 <b>用法错误</b>：请回复用户的某条消息输入 <code>/ban [理由]</code>，或直接输入 <code>/ban &lt;UID&gt; [理由]</code>。",
+                        "parse_mode": "HTML",
+                        "reply_parameters": {"message_id": msg_id}
                     })
+                    return Response("OK")
+
+                # 记录封禁到 KV
+                ban_data = {"reason": reason, "user_id": target_user_id}
+                await env.pmbot_captcha.put(f"banned:{target_user_id}", json.dumps(ban_data))
+
+                # 发送通知给被封禁用户
+                if reason:
+                    user_notice = (
+                        "🚫 <b>通知</b>：您已被管理员封禁，无法继续发送消息。\n"
+                        f"<b>封禁原因:</b> {html.escape(reason)}"
+                    )
                 else:
+                    user_notice = "🚫 <b>通知</b>：您已被管理员封禁，无法继续发送消息。"
+
+                try:
                     await tg_request(env, "sendMessage", {
-                        "chat_id": admin_id,
-                        "text": "💡 <b>提示</b>：请直接【回复】某条用户的消息以发送回复给对方。",
+                        "chat_id": target_user_id,
+                        "text": user_notice,
                         "parse_mode": "HTML"
                     })
+                except Exception:
+                    pass
+
+                # 回复管理员确认
+                confirm_msg = f"✅ 已成功封禁用户 <code>{target_user_id}</code>。"
+                if reason:
+                    confirm_msg += f"\n<b>封禁原因:</b> {html.escape(reason)}"
+                await tg_request(env, "sendMessage", {
+                    "chat_id": admin_id,
+                    "text": confirm_msg,
+                    "parse_mode": "HTML",
+                    "reply_parameters": {"message_id": msg_id}
+                })
+                return Response("OK")
+
+            # ----- 命令：/unban (解封) -----
+            if cmd == "/unban":
+                target_user_id = None
+                if reply_to:
+                    admin_replied_msg_id = reply_to.get("message_id")
+                    mapping_raw = await env.pmbot_captcha.get(f"a2u:{admin_replied_msg_id}")
+                    if mapping_raw:
+                        target_user_id = json.loads(mapping_raw)["user_id"]
+                elif len(tokens) > 1 and tokens[1].isdigit():
+                    target_user_id = int(tokens[1])
+
+                if not target_user_id:
+                    await tg_request(env, "sendMessage", {
+                        "chat_id": admin_id,
+                        "text": "💡 <b>用法错误</b>：请回复用户的某条消息输入 <code>/unban</code>，或输入 <code>/unban &lt;UID&gt;</code>。",
+                        "parse_mode": "HTML",
+                        "reply_parameters": {"message_id": msg_id}
+                    })
+                    return Response("OK")
+
+                await env.pmbot_captcha.delete(f"banned:{target_user_id}")
+
+                # 通知用户解封
+                try:
+                    await tg_request(env, "sendMessage", {
+                        "chat_id": target_user_id,
+                        "text": "✅ <b>通知</b>：您的封禁已被管理员解除，现在可以重新发送消息。",
+                        "parse_mode": "HTML"
+                    })
+                except Exception:
+                    pass
+
+                await tg_request(env, "sendMessage", {
+                    "chat_id": admin_id,
+                    "text": f"✅ 已成功解除对用户 <code>{target_user_id}</code> 的封禁。",
+                    "parse_mode": "HTML",
+                    "reply_parameters": {"message_id": msg_id}
+                })
+                return Response("OK")
+
+            # ----- 命令：/info (查看名片) -----
+            if cmd == "/info":
+                if not reply_to:
+                    await tg_request(env, "sendMessage", {
+                        "chat_id": admin_id,
+                        "text": "💡 请直接【回复】某条用户的消息并发送 <code>/info</code> 查看该用户详情。",
+                        "parse_mode": "HTML",
+                        "reply_parameters": {"message_id": msg_id}
+                    })
+                    return Response("OK")
+                
+                admin_replied_msg_id = reply_to.get("message_id")
+                mapping_raw = await env.pmbot_captcha.get(f"a2u:{admin_replied_msg_id}")
+                if not mapping_raw:
+                    await tg_request(env, "sendMessage", {
+                        "chat_id": admin_id,
+                        "text": "⚠️ 未找到该消息的用户映射记录或已过期。",
+                        "reply_parameters": {"message_id": msg_id}
+                    })
+                    return Response("OK")
+                
+                target_user_id = json.loads(mapping_raw)["user_id"]
+                is_ver = await env.pmbot_captcha.get(f"verified:{target_user_id}")
+                is_ban = await env.pmbot_captcha.get(f"banned:{target_user_id}")
+                dc_info = await get_user_dc(env, target_user_id)
+                
+                # 尝试获取 Telegram 详细信息
+                u_chat = await tg_request(env, "getChat", {"chat_id": target_user_id})
+                u_res = u_chat.get("result", {}) if u_chat.get("ok") else {}
+                u_name = html.escape(f"{u_res.get('first_name', '')} {u_res.get('last_name', '')}".strip() or "未知")
+                u_uname = f"@{u_res['username']}" if u_res.get("username") else "null"
+                
+                ver_status = "已验证 ✅" if is_ver else "未验证 ⏳"
+                ban_status = "已封禁 🚫" if is_ban else "正常 🟢"
+                
+                info_card = (
+                    "📋 <b>用户详情信息</b>\n\n"
+                    f"<b>UID:</b> <code>{target_user_id}</code>\n"
+                    f"<b>昵称:</b> <code>{u_name}</code>\n"
+                    f"<b>用户名:</b> {u_uname}\n"
+                    f"<b>数据中心:</b> {dc_info}\n"
+                    f"<b>验证状态:</b> {ver_status}\n"
+                    f"<b>账号状态:</b> {ban_status}"
+                )
+                await tg_request(env, "sendMessage", {
+                    "chat_id": admin_id,
+                    "text": info_card,
+                    "parse_mode": "HTML",
+                    "reply_parameters": {"message_id": msg_id}
+                })
+                return Response("OK")
+
+            # ----- 普通回复：转发给用户 -----
+            if not reply_to:
+                await tg_request(env, "sendMessage", {
+                    "chat_id": admin_id,
+                    "text": "💡 <b>提示</b>：请直接【回复】某条用户的转发消息来发送回复给对方。",
+                    "parse_mode": "HTML"
+                })
                 return Response("OK")
             
-            # Admin replied to a message in admin chat
             admin_replied_msg_id = reply_to.get("message_id")
             mapping_raw = await env.pmbot_captcha.get(f"a2u:{admin_replied_msg_id}")
             if not mapping_raw:
@@ -228,7 +421,7 @@ async def on_fetch(request, env):
             target_user_id = mapping["user_id"]
             target_user_msg_id = mapping["user_msg_id"]
             
-            # Send to user via copyMessage (无引用转发) with reply_parameters to preserve quote
+            # 使用 copyMessage 无引用转发给用户，并携带引用指向用户原消息
             copy_res = await tg_request(env, "copyMessage", {
                 "chat_id": target_user_id,
                 "from_chat_id": admin_id,
@@ -241,7 +434,9 @@ async def on_fetch(request, env):
             
             if copy_res.get("ok"):
                 delivered_user_msg_id = copy_res["result"]["message_id"]
-                # Map this reply so future replies to this message can be routed back
+                # 打上 Reaction 表情反馈告知管理员发送成功
+                await set_message_reaction(env, admin_id, msg_id, "👌")
+                # 记录该回复消息的双向映射
                 await env.pmbot_captcha.put(
                     f"a2u:{msg_id}",
                     json.dumps({"user_id": target_user_id, "user_msg_id": delivered_user_msg_id}),
@@ -253,23 +448,63 @@ async def on_fetch(request, env):
                     expirationTtl=2592000
                 )
             else:
-                desc = copy_res.get("description", "未知错误")
+                # 细分 403 故障识别：屏蔽 vs 注销
+                desc = copy_res.get("description", "")
+                err_code = copy_res.get("error_code")
+                desc_lower = desc.lower()
+
+                if err_code == 403 or "forbidden" in desc_lower:
+                    if "bot was blocked by the user" in desc_lower:
+                        fail_text = "🚫 <b>发送失败</b>：对方已将 Bot 屏蔽，消息无法送达。"
+                    elif "user is deactivated" in desc_lower:
+                        fail_text = "⚠️ <b>发送失败</b>：对方账号已注销（Deactivated），消息无法送达。"
+                    else:
+                        fail_text = f"🚫 <b>发送失败</b>：无权限向该用户发送消息（{html.escape(desc)}）。"
+                else:
+                    fail_text = f"❌ <b>发送失败</b>：{html.escape(desc)}"
+
                 await tg_request(env, "sendMessage", {
                     "chat_id": admin_id,
-                    "text": f"❌ 发送失败: {desc}",
+                    "text": fail_text,
+                    "parse_mode": "HTML",
                     "reply_parameters": {"message_id": msg_id}
                 })
             
             return Response("OK")
-        
-        # -------------------------------------------------------------
-        # 2. MESSAGE FROM USER (Stranger)
-        # -------------------------------------------------------------
-        # Check if user is verified
+
+        # =============================================================
+        # 2. 来自访客用户的消息
+        # =============================================================
+        # 2.1 检查是否被封禁
+        banned_raw = await env.pmbot_captcha.get(f"banned:{sender_id}")
+        if banned_raw:
+            if text.strip() == "/start":
+                banned_data = json.loads(banned_raw) if banned_raw != "true" else {}
+                r = banned_data.get("reason")
+                if r:
+                    t = f"🚫 您已被封禁，无法使用此机器人。\n<b>原因:</b> {html.escape(r)}"
+                else:
+                    t = "🚫 您已被封禁，无法使用此机器人。"
+                await tg_request(env, "sendMessage", {
+                    "chat_id": sender_id,
+                    "text": t,
+                    "parse_mode": "HTML"
+                })
+            return Response("OK")
+
+        # 2.2 频率限制检查 (10秒最多5条)
+        if not await check_rate_limit(env, sender_id):
+            await tg_request(env, "sendMessage", {
+                "chat_id": sender_id,
+                "text": "⚠️ <b>发送过于频繁</b>，请稍候再试（10秒限制5条消息）。",
+                "parse_mode": "HTML"
+            })
+            return Response("OK")
+
+        # 2.3 检查是否已通过 Captcha 验证
         is_verified = await env.pmbot_captcha.get(f"verified:{sender_id}")
         
         if not is_verified:
-            # Check if there is a pending captcha for this user
             pending_raw = await env.pmbot_captcha.get(f"captcha_pending:{sender_id}")
             if pending_raw:
                 pending = json.loads(pending_raw)
@@ -277,11 +512,11 @@ async def on_fetch(request, env):
                 cleaned_input = text.strip()
                 
                 if cleaned_input == expected_code:
-                    # Verification successful!
+                    # 验证成功
                     await env.pmbot_captcha.put(f"verified:{sender_id}", "true")
                     await env.pmbot_captcha.delete(f"captcha_pending:{sender_id}")
                     
-                    # Delete the captcha message if possible to keep chat clean
+                    # 尝试清理旧验证码消息
                     if pending.get("captcha_msg_id"):
                         try:
                             await tg_request(env, "deleteMessage", {
@@ -291,19 +526,21 @@ async def on_fetch(request, env):
                         except Exception:
                             pass
                     
-                    # Notify user
+                    # 打上 Reaction 标记
+                    await set_message_reaction(env, sender_id, msg_id, "👌")
+
                     await tg_request(env, "sendMessage", {
                         "chat_id": sender_id,
                         "text": "✅ <b>验证成功！</b>\n您的会话已解锁，消息已成功发送给主人。",
                         "parse_mode": "HTML"
                     })
                     
-                    # Send info banner to admin + forward original message if exists
+                    # 发送名片与留存消息
                     orig_id = pending.get("original_msg_id")
                     await handle_user_verified_banner(env, from_user, orig_id)
                     return Response("OK")
                 else:
-                    # User entered wrong code
+                    # 验证码错误
                     await tg_request(env, "sendMessage", {
                         "chat_id": sender_id,
                         "text": "❌ <b>验证码错误</b>，请仔细观察上方图片中的 2 位数字并重新输入：",
@@ -311,14 +548,12 @@ async def on_fetch(request, env):
                     })
                     return Response("OK")
             
-            # No active captcha, generate one
-            # If user sent /start, don't treat /start as original message to forward
+            # 无有效验证码，生成并下发
             orig_msg_id = None if text.strip() == "/start" else msg_id
             await send_captcha(env, sender_id, orig_msg_id)
             return Response("OK")
         
-        # User is already verified:
-        # Handle /start for verified users
+        # 2.4 已验证用户的 /start
         if text.strip() == "/start":
             await tg_request(env, "sendMessage", {
                 "chat_id": sender_id,
@@ -326,37 +561,19 @@ async def on_fetch(request, env):
             })
             return Response("OK")
         
-        # User forwards message to Admin:
-        # Check if user message is a reply
-        reply_to = message.get("reply_to_message")
-        fwd_res = None
-        
-        if reply_to:
-            replied_user_msg_id = reply_to.get("message_id")
-            target_admin_msg_id = await env.pmbot_captcha.get(f"u2a:{sender_id}:{replied_user_msg_id}")
-            if target_admin_msg_id:
-                # Use copyMessage to Admin with reply_parameters so Admin sees the reply quote
-                fwd_res = await tg_request(env, "copyMessage", {
-                    "chat_id": admin_id,
-                    "from_chat_id": sender_id,
-                    "message_id": msg_id,
-                    "reply_parameters": {
-                        "message_id": int(target_admin_msg_id),
-                        "allow_sending_without_reply": True
-                    }
-                })
-        
-        # If not a reply, or target_admin_msg_id not found, use forwardMessage (直接转发，展示对方名片)
-        if not fwd_res or not fwd_res.get("ok"):
-            fwd_res = await tg_request(env, "forwardMessage", {
-                "chat_id": admin_id,
-                "from_chat_id": sender_id,
-                "message_id": msg_id
-            })
+        # 2.5 正常直接转发给管理员 (保持 forwardMessage，展示访客真实名片)
+        fwd_res = await tg_request(env, "forwardMessage", {
+            "chat_id": admin_id,
+            "from_chat_id": sender_id,
+            "message_id": msg_id
+        })
         
         if fwd_res.get("ok"):
             admin_msg_id = fwd_res["result"]["message_id"]
-            # Save mapping (30 days TTL)
+            # 给访客的消息打上 Reaction 表情反馈投递成功
+            await set_message_reaction(env, sender_id, msg_id, "👌")
+            
+            # 记录双向映射 (30天 TTL)
             await env.pmbot_captcha.put(
                 f"a2u:{admin_msg_id}",
                 json.dumps({"user_id": sender_id, "user_msg_id": msg_id}),
@@ -372,4 +589,4 @@ async def on_fetch(request, env):
         
     except Exception as e:
         print(f"Exception in on_fetch: {e}\n{traceback.format_exc()}")
-        return Response("OK") # Always return 200 to Telegram
+        return Response("OK")
