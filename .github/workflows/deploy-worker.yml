@@ -1,0 +1,59 @@
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'wrangler.toml'
+      - '.github/workflows/deploy-worker.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy-worker:
+    name: Deploy CF Worker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Deploy to Cloudflare Workers
+        run: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Sync Worker Secrets
+        run: |
+          if [ -n "$BOT_TOKEN" ]; then
+            echo "$BOT_TOKEN" | wrangler secret put BOT_TOKEN
+            echo "✅ Successfully synced BOT_TOKEN to Cloudflare Worker"
+          else
+            echo "ℹ️ BOT_TOKEN not provided in GitHub Secrets, skipping"
+          fi
+          if [ -n "$ADMIN_UID" ]; then
+            echo "$ADMIN_UID" | wrangler secret put ADMIN_UID
+            echo "✅ Successfully synced ADMIN_UID to Cloudflare Worker"
+          else
+            echo "ℹ️ ADMIN_UID not provided in GitHub Secrets, skipping"
+          fi
+          if [ -n "$TG_WEBHOOK_SECRET" ]; then
+            echo "$TG_WEBHOOK_SECRET" | wrangler secret put TG_WEBHOOK_SECRET
+            echo "✅ Successfully synced TG_WEBHOOK_SECRET to Cloudflare Worker"
+          else
+            echo "ℹ️ TG_WEBHOOK_SECRET not provided in GitHub Secrets, skipping"
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_UID: ${{ secrets.ADMIN_UID }}
+          TG_WEBHOOK_SECRET: ${{ secrets.TG_WEBHOOK_SECRET }}

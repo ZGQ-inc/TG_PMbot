@@ -106,17 +106,54 @@ info - 查看用户完整名片与状态 (仅管理员)
 
 ## 🚀 快速部署指南
 
-### 1. 前置准备
-- 一个 [Cloudflare](https://dash.cloudflare.com/) 账号并安装 [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/)：
-  ```bash
-  npm install -g wrangler
-  wrangler login
-  ```
-- 从 [@BotFather](https://t.me/BotFather) 获取你的 Telegram Bot Token。
-- 获取你的 Telegram 账号数字 UID（可通过 [@userinfobot](https://t.me/userinfobot) 查询）。
+本项目支持 **GitHub Actions 自动化 CI/CD 持续部署**（推荐）与 **本地 Wrangler CLI 手动部署** 两种方式。
 
-### 2. 创建 Workers KV 命名空间
-在项目根目录运行以下命令创建 KV：
+---
+
+### 方案 A：GitHub Actions 自动持续部署（推荐）
+
+通过 GitHub Actions，您只需向仓库推送代码或手动点击执行，即可自动完成部署并将密钥安全同步至 Cloudflare Workers。
+
+#### 1. 前置准备
+- 准备一个 [Cloudflare](https://dash.cloudflare.com/) 账号。
+- 从 [@BotFather](https://t.me/BotFather) 创建 Bot 并获取 `BOT_TOKEN`。
+- 获取您的 Telegram 账号数字 UID（可通过 [@userinfobot](https://t.me/userinfobot) 发送 `/start` 查看）。
+- 在 Cloudflare 控制台创建 Workers KV：
+  - 进入 **Workers 和 Pages** -> **KV** -> **创建命名空间**，名称命名为 `pmbot_captcha`。
+  - 获取生成的命名空间 ID，并在仓库中的 `wrangler.toml` 文件中将 `id = "..."` 替换为您自己的 KV ID。
+
+#### 2. 配置 GitHub 仓库 Secrets
+在您的 GitHub 仓库页面，依次点击 **Settings** -> **Secrets and variables** -> **Actions** -> **New repository secret**，添加以下密钥：
+
+| Secret 变量名 | 必填 | 说明与获取路径 |
+| :--- | :---: | :--- |
+| `CF_API_TOKEN` | **是** | Cloudflare API Token。获取路径：Cloudflare 控制台 -> **我的个人资料 (Profile)** -> **API 令牌** -> **创建令牌** -> 选择 **“编辑 Cloudflare Workers”** 模板创建。 |
+| `CF_ACCOUNT_ID` | **是** | Cloudflare 账户 ID。获取路径：Cloudflare 控制台 -> **Workers 和 Pages** 概览页 -> 右侧侧边栏查看 **“账户 ID”**。 |
+| `BOT_TOKEN` | **是** | Telegram 机器人的 Token（格式如 `123456789:ABCdef...`）。工作流会自动将其同步至 Worker 的加密环境变量。 |
+| `ADMIN_UID` | **是** | 管理员的数字 UID（纯数字，如 `1100381322`）。工作流会自动将其同步至 Worker 的加密环境变量。 |
+| `TG_WEBHOOK_SECRET` | 否 | Webhook 鉴权防伪密钥（推荐），填入一段自定义的高强度随机字符串。若配置，工作流会自动同步至 Worker。 |
+
+> [!NOTE]
+> 工作流同时兼容 `CF_API_TOKEN` / `CLOUDFLARE_API_TOKEN` 以及 `CF_ACCOUNT_ID` / `CLOUDFLARE_ACCOUNT_ID`。
+
+#### 3. 触发自动化部署
+- **自动触发**：推送代码至 `main` 分支（当修改了 `src/**`、`wrangler.toml` 或工作流文件时）将自动触发构建与发布。
+- **手动触发**：进入仓库 **Actions** 标签页 -> 选择 **Deploy Cloudflare Worker** -> 点击 **Run workflow** 即可随时手动触发。
+- 工作流会自动执行 `wrangler deploy` 部署脚本，并按需执行 `wrangler secret put` 自动更新 Worker 环境变量。
+
+---
+
+### 方案 B：本地 Wrangler CLI 手动部署
+
+如果您更倾向于在本地终端手动操作，可按照以下步骤部署：
+
+#### 1. 前置准备
+```bash
+npm install -g wrangler
+wrangler login
+```
+
+#### 2. 创建 Workers KV 命名空间
 ```bash
 wrangler kv namespace create pmbot_captcha
 ```
@@ -127,37 +164,38 @@ binding = "pmbot_captcha"
 id = "你的_KV_ID"
 ```
 
-### 3. 配置加密 Secrets
-无需在配置文件中编写明文凭据，通过命令行安全注入：
+#### 3. 配置加密 Secrets
+通过命令行安全注入敏感凭据（无需写入配置文件）：
 ```bash
 # 1. 注入 Bot Token
 wrangler secret put BOT_TOKEN
-# 提示输入时粘贴你的 Token，如：<YOUR_BOT_TOKEN>
 
 # 2. 注入 管理员 UID
 wrangler secret put ADMIN_UID
-# 提示输入时粘贴你的 UID，如：<YOUR_TELEGRAM_UID>
 
 # 3. 注入 Webhook 鉴权密钥 (可选但强烈推荐)
 wrangler secret put TG_WEBHOOK_SECRET
-# 输入一段自定义的高强度随机字符串，用于验证请求来自 Telegram
 ```
 
-### 4. 部署 Worker
-执行一键部署：
+#### 4. 部署 Worker
 ```bash
 wrangler deploy
 ```
-部署成功后，Wrangler 会给出你的 Worker 域名（例如：`https://tg-pmbot.<your-subdomain>.workers.dev`）。
+部署成功后，控制台会输出 Worker 分配的域名（例如：`https://tg-pmbot.<your-subdomain>.workers.dev`）。
 
-### 5. 绑定 Telegram Webhook
-使用 `curl` 设置 Webhook（将 `<BOT_TOKEN>`、`<WORKER_URL>`、`<WEBHOOK_SECRET>` 替换为你的真实值）：
+---
+
+### 5. 绑定 Telegram Webhook（无论使用方案 A 还是方案 B，均需执行一次）
+
+部署成功获得 Worker URL 后，使用 `curl` 向 Telegram 官方接口注册 Webhook（将 `<BOT_TOKEN>`、`<WORKER_URL>`、`<WEBHOOK_SECRET>` 替换为实际值）：
 ```bash
 curl -F "url=https://<WORKER_URL>" \
      -F "secret_token=<WEBHOOK_SECRET>" \
      https://api.telegram.org/bot<BOT_TOKEN>/setWebhook
 ```
-当接口返回 `{"ok":true,"result":true,"description":"Webhook was set"}` 时，即代表配置成功！🎉
+> 若未设置 `TG_WEBHOOK_SECRET`，可省略 `-F "secret_token=..."` 参数。
+
+接口返回 `{"ok":true,"result":true,"description":"Webhook was set"}` 时，即代表机器人对接完成！🎉
 
 ---
 
@@ -176,13 +214,16 @@ curl -F "url=https://<WORKER_URL>" \
 
 ```text
 TG_PMbot/
+├── .github/
+│   └── workflows/
+│       └── deploy-worker.yml # GitHub Actions 自动部署与密钥同步工作流
 ├── src/
-│   └── entry.py          # Python Worker 核心代码 (含 Captcha、DC 解码、双向映射、Reaction、403识别、Ban)
-├── .gitignore            # Git 忽略规则 (防误传本地缓存)
-├── LICENSE               # MIT 开源协议
-├── README.md             # 项目完整文档
-├── wrangler.toml         # Wrangler 生产部署配置 (无敏感明文)
-└── wrangler.toml.example # 开源示例配置文件
+│   └── entry.py              # Python Worker 核心代码 (含 Captcha、DC 解码、双向映射、Reaction、403识别、Ban)
+├── .gitignore                # Git 忽略规则 (防误传本地缓存)
+├── LICENSE                   # MIT 开源协议
+├── README.md                 # 项目完整文档
+├── wrangler.toml             # Wrangler 生产部署配置 (无敏感明文)
+└── wrangler.toml.example     # 开源示例配置文件
 ```
 
 ---
