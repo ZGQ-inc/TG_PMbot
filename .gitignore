@@ -221,3 +221,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Cloudflare Workers
+.wrangler/
+.dev.vars
+.env
