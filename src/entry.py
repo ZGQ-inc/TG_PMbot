@@ -473,6 +473,24 @@ async def on_fetch(request, env):
             })
             return Response("OK")
 
+        if cmd in ["/ban", "/unban", "/info"]:
+            await tg_request(env, "sendMessage", {
+                "chat_id": sender_id,
+                "text": "⚠️ <b>权限不足</b>：该命令仅限管理员使用。",
+                "parse_mode": "HTML",
+                "reply_parameters": {"message_id": msg_id}
+            })
+            return Response("OK")
+
+        if cmd == "/help":
+            await tg_request(env, "sendMessage", {
+                "chat_id": sender_id,
+                "text": "💡 <b>使用说明</b>：直接在此发送您想咨询的内容即可，主人收到后会尽快回复您。\n（注：管理命令仅限管理员使用）",
+                "parse_mode": "HTML",
+                "reply_parameters": {"message_id": msg_id}
+            })
+            return Response("OK")
+
         is_verified = await env.pmbot_captcha.get(f"verified:{sender_id}")
         
         if not is_verified:
