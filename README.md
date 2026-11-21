@@ -5,14 +5,14 @@
 [![Python](https://img.shields.io/badge/Python-3.12%20(Pyodide)-3776AB?logo=python&logoColor=white)](https://pyodide.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-轻量、高性能、零成本的 **Telegram 私聊反代/客服转发机器人**。  
+轻量、高性能、零成本的 **Telegram 私聊机器人**。  
 基于 **Cloudflare Workers (Python Runtime)** 与 **Cloudflare D1 关系型 SQL 数据库** 架构，无需自备服务器，全球边缘低延迟直连 Telegram。
 
 ---
 
 ## ✨ 核心特性
 
-- **🗄️ 全面升级 Cloudflare D1 SQL 关系型存储**：
+- **🗄️ Cloudflare D1 SQL 关系型存储**：
   - 彻底抛弃 KV 限制（KV 免费版仅 1,000 次/天写操作），升级为 D1 每日 **100,000 次行写入**（配额提升 100 倍！高并发/多对话无压力）。
   - **5 张精细化分表设计**：
     - `messages`：双向消息 ID 映射表，一条记录即可同时支撑双方的原生 Reply 引用溯源。
@@ -50,7 +50,6 @@
 - **🧰 工具箱命令 (`/info`)**：
   - 管理员回复任意用户消息发送 `/info`，随时重新调出该用户的详细资料、数据中心与账号状态。
 - **🔐 零泄露 Secrets 安全体系**：
-  - 代码库中不包含任何敏感 Token 或 UID，配置文件已与密钥完全解耦。
   - 敏感凭据（`BOT_TOKEN`、`ADMIN_UID`、`TG_WEBHOOK_SECRET`）全部采用 Cloudflare Worker Secrets 加密保存。
   - 自动校验 Telegram `X-Telegram-Bot-Api-Secret-Token` 请求头，杜绝外部伪造 Webhook。
 
@@ -95,20 +94,6 @@ sequenceDiagram
     else 发送失败 (403 屏蔽/注销)
         Worker->>Admin: 精准提示：对方已屏蔽 Bot / 账号已注销
     end
-```
-
----
-
-## 📋 BotFather 指令设置清单
-
-在 [@BotFather](https://t.me/BotFather) 中使用 `/setcommands` 命令，复制粘贴以下文本即可配置快捷指令提示：
-
-```text
-start - 开始使用并进行人机验证
-help - 查看帮助说明与管理员指令
-ban - 封禁用户 (仅管理员)
-unban - 解封用户 (仅管理员)
-info - 查看用户完整名片与状态 (仅管理员)
 ```
 
 ---
@@ -219,6 +204,20 @@ curl -F "url=https://<WORKER_URL>" \
 > 若未设置 `TG_WEBHOOK_SECRET`，可省略 `-F "secret_token=..."` 参数。
 
 接口返回 `{"ok":true,"result":true,"description":"Webhook was set"}` 时，即代表机器人对接完成！🎉
+
+---
+
+## 📋 BotFather 指令设置清单
+
+在 [@BotFather](https://t.me/BotFather) 中使用 `/setcommands` 命令，复制粘贴以下文本即可配置快捷指令提示：
+
+```text
+start - 开始使用并进行人机验证
+help - 查看帮助说明与管理员指令
+ban - 封禁用户 (仅管理员)
+unban - 解封用户 (仅管理员)
+info - 查看用户完整名片与状态 (仅管理员)
+```
 
 ---
 
