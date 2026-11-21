@@ -1,21 +1,30 @@
 # TG_PMbot 🤖
 
 [![Deploy to Cloudflare Workers](https://img.shields.io/badge/Deploy%20to-Cloudflare%20Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
+[![Database: Cloudflare D1](https://img.shields.io/badge/Database-Cloudflare%20D1%20SQL-3776AB?logo=sqlite&logoColor=white)](https://developers.cloudflare.com/d1/)
 [![Python](https://img.shields.io/badge/Python-3.12%20(Pyodide)-3776AB?logo=python&logoColor=white)](https://pyodide.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 轻量、高性能、零成本的 **Telegram 私聊反代/客服转发机器人**。  
-基于 **Cloudflare Workers (Python Runtime)** 与 **Workers KV** 架构，无需自备服务器，全球边缘低延迟直连 Telegram。
+基于 **Cloudflare Workers (Python Runtime)** 与 **Cloudflare D1 关系型 SQL 数据库** 架构，无需自备服务器，全球边缘低延迟直连 Telegram。
 
 ---
 
 ## ✨ 核心特性
 
+- **🗄️ 全面升级 Cloudflare D1 SQL 关系型存储**：
+  - 彻底抛弃 KV 限制（KV 免费版仅 1,000 次/天写操作），升级为 D1 每日 **100,000 次行写入**（配额提升 100 倍！高并发/多对话无压力）。
+  - **5 张精细化分表设计**：
+    - `messages`：双向消息 ID 映射表，一条记录即可同时支撑双方的原生 Reply 引用溯源。
+    - `users`：访客用户资料与验证状态库（持久化记录 UID、昵称、用户名、头像 DC 节点及验证时间）。
+    - `banned_users`：黑名单表（支持记录封禁理由与封禁时间戳）。
+    - `pending_captchas`：人机验证临时表（存储 5 分钟有效期的动态点阵验证码）。
+    - `rate_limits`：用户级滑动窗口频控表（突破 KV 60秒最小 TTL 限制）。
 - **🔄 双向消息原生转发与引用（Reply）支持**：
   - **访客发消息**：通过 `forwardMessage` **直接转发**给管理员，完整保留对方名片信息、头像与 Telegram 转发来源标签，方便识别对方身份。
   - **管理员回复**：管理员在私聊中直接【回复】某条转发消息，Bot 将通过 `copyMessage` **无引用转发**给对方（隐匿管理员真实账号），同时在用户侧精准还原对原消息的引用关联（Quote）。
   - **双向引用保持**：双方使用 Telegram 的 Reply 功能时，均可在接收端精准看到被引用的原消息。
-  - **30 天索引存储**：基于 Workers KV 自动维护双向消息 ID 映射关系，TTL 30 天自动过期，杜绝垃圾数据堆积。
+  - **30 天索引存储**：基于 D1 自动维护双向消息 ID 映射关系与索引，TTL 30 天自动过期，杜绝垃圾数据堆积。
 - **👌 原生 Reaction 表情投递反馈**：
   - 消息转发成功后，Bot 自动在原消息上打上 `👌` 表情反应（无需多余提示气泡，体验极度轻量丝滑）。
 - **🛡️ 创新 ASCII 点阵 Captcha 验证**：
@@ -55,34 +64,34 @@ sequenceDiagram
     actor User as 访客用户
     participant TG as Telegram API
     participant Worker as Cloudflare Worker (Python)
-    participant KV as Workers KV (pmbot_captcha)
+    participant D1 as Cloudflare D1 SQL (pmbot)
     actor Admin as 管理员
 
     User->>TG: 发送私聊消息
     TG->>Worker: Webhook (Update)
-    Worker->>KV: 检查封禁与频控 (banned / ratelimit)
-    Worker->>KV: 检查验证状态 verified:{uid}
+    Worker->>D1: 检查封禁与频控 (banned_users / rate_limits)
+    Worker->>D1: 检查验证状态 users(is_verified)
     alt 未通过验证
         Worker->>User: 下发 ASCII 等宽点阵验证码
         User->>Worker: 回复 2 位数字验证码
-        Worker->>KV: 写入 verified:{uid} = true
+        Worker->>D1: 写入 users(is_verified = 1)
         Worker->>User: 打上 👌 表情
         Worker->>Admin: 推送用户详细名片 (昵称/UID/DC)
         Worker->>Admin: 转发用户首次发送的消息
     else 已通过验证
         Worker->>Admin: forwardMessage (直接转发，保留名片)
         Worker->>User: 打上 👌 表情 (投递成功)
-        Worker->>KV: 记录双方消息映射 (a2u / u2a, TTL 30天)
+        Worker->>D1: 记录双方消息映射 (messages, TTL 30天)
     end
 
     Note over Admin, Worker: 管理员回复
     Admin->>TG: 【回复】用户的某条转发消息
     TG->>Worker: Webhook (Update)
-    Worker->>KV: 查询该消息映射 (a2u)
+    Worker->>D1: 查询该消息映射 (messages)
     alt 目标用户有效
         Worker->>User: copyMessage (无引用转发，带引用原消息)
         Worker->>Admin: 打上 👌 表情 (投递成功)
-        Worker->>KV: 记录该回复的双方映射
+        Worker->>D1: 记录该回复的双方映射
     else 发送失败 (403 屏蔽/注销)
         Worker->>Admin: 精准提示：对方已屏蔽 Bot / 账号已注销
     end
@@ -118,9 +127,16 @@ info - 查看用户完整名片与状态 (仅管理员)
 - 准备一个 [Cloudflare](https://dash.cloudflare.com/) 账号。
 - 从 [@BotFather](https://t.me/BotFather) 创建 Bot 并获取 `BOT_TOKEN`。
 - 获取您的 Telegram 账号数字 UID（可通过 [@userinfobot](https://t.me/userinfobot) 发送 `/start` 查看）。
-- 在 Cloudflare 控制台创建 Workers KV：
-  - 进入 **Workers 和 Pages** -> **KV** -> **创建命名空间**，名称命名为 `pmbot_captcha`。
-  - 获取生成的命名空间 ID，并在仓库中的 `wrangler.toml` 文件中将 `id = "..."` 替换为您自己的 KV ID。
+- 在 Cloudflare 创建 D1 数据库并初始化表结构：
+  ```bash
+  # 1. 创建名为 pmbot 的 D1 数据库
+  wrangler d1 create pmbot
+
+  # 2. 将控制台输出的 database_id 填入 wrangler.toml 的 [[d1_databases]] 中
+
+  # 3. 执行建表脚本初始化 5 张数据表
+  wrangler d1 execute pmbot --remote --file=./schema.sql
+  ```
 
 #### 2. 配置 GitHub 仓库 Secrets
 在您的 GitHub 仓库页面，依次点击 **Settings** -> **Secrets and variables** -> **Actions** -> **New repository secret**，添加以下密钥：
@@ -137,7 +153,7 @@ info - 查看用户完整名片与状态 (仅管理员)
 > 工作流同时兼容 `CF_API_TOKEN` / `CLOUDFLARE_API_TOKEN` 以及 `CF_ACCOUNT_ID` / `CLOUDFLARE_ACCOUNT_ID`。
 
 #### 3. 触发自动化部署
-- **自动触发**：推送代码至 `main` 分支（当修改了 `src/**`、`wrangler.toml` 或工作流文件时）将自动触发构建与发布。
+- **自动触发**：推送代码至 `main` 分支（当修改了 `src/**`、`wrangler.toml`、`schema.sql` 或工作流文件时）将自动触发构建与发布。
 - **手动触发**：进入仓库 **Actions** 标签页 -> 选择 **Deploy Cloudflare Worker** -> 点击 **Run workflow** 即可随时手动触发。
 - 工作流会自动执行 `wrangler deploy` 部署脚本，并按需执行 `wrangler secret put` 自动更新 Worker 环境变量。
 
@@ -153,15 +169,22 @@ npm install -g wrangler
 wrangler login
 ```
 
-#### 2. 创建 Workers KV 命名空间
+#### 2. 创建 Cloudflare D1 数据库并初始化
 ```bash
-wrangler kv namespace create pmbot_captcha
+# 1. 创建数据库
+wrangler d1 create pmbot
+
+# 2. 将输出的 database_id 填入 wrangler.toml 中的 [[d1_databases]] 区域：
 ```
-控制台将输出该 KV 的 `id`，将其填入 `wrangler.toml` 中的 `[[kv_namespaces]]` 区域：
 ```toml
-[[kv_namespaces]]
-binding = "pmbot_captcha"
-id = "你的_KV_ID"
+[[d1_databases]]
+binding = "DB"
+database_name = "pmbot"
+database_id = "你的_D1_DATABASE_ID"
+```
+```bash
+# 3. 一键初始化 5 张数据表结构
+wrangler d1 execute pmbot --remote --file=./schema.sql
 ```
 
 #### 3. 配置加密 Secrets
@@ -199,6 +222,20 @@ curl -F "url=https://<WORKER_URL>" \
 
 ---
 
+## 📊 D1 数据表结构说明
+
+本项目采用 5 张职责分明的 SQL 表替代旧版非结构化 KV 存储：
+
+| 数据表名 | 主键 | 作用说明 |
+| :--- | :--- | :--- |
+| `messages` | `admin_msg_id` | **双向消息映射表**：单行同时记录管理员消息 ID 与访客消息 ID，支撑双向 Quote 引用溯源与自动过期。 |
+| `users` | `user_id` | **访客档案与验证状态表**：持久化保存 UID、昵称、用户名、头像 DC 节点及验证通过时间戳。 |
+| `banned_users` | `user_id` | **黑名单表**：存储被封禁用户 UID、封禁原因（Reason）及封禁时间。 |
+| `pending_captchas` | `user_id` | **待验证人机验证码表**：临时存储 5 分钟有效期的动态生成 7H 点阵图形验证码与关联消息。 |
+| `rate_limits` | `user_id` | **频控表**：滑动窗口限频计数，彻底突破 KV 60秒最小 TTL 限制。 |
+
+---
+
 ## 💡 管理员操作指南
 
 1. **回复用户**：在 Bot 窗口中，直接**引用回复（Reply）**用户的任意消息，Bot 会自动无缝传递给对方。
@@ -218,11 +255,12 @@ TG_PMbot/
 │   └── workflows/
 │       └── deploy-worker.yml # GitHub Actions 自动部署与密钥同步工作流
 ├── src/
-│   └── entry.py              # Python Worker 核心代码 (含 Captcha、DC 解码、双向映射、Reaction、403识别、Ban)
+│   └── entry.py              # Python Worker 核心代码 (含 Captcha、DC 解码、D1 操作、Reaction、403识别、Ban)
 ├── .gitignore                # Git 忽略规则 (防误传本地缓存)
 ├── LICENSE                   # MIT 开源协议
 ├── README.md                 # 项目完整文档
-├── wrangler.toml             # Wrangler 生产部署配置 (无敏感明文)
+├── schema.sql                # Cloudflare D1 关系型数据库结构文件 (5 张分表)
+├── wrangler.toml             # Wrangler 生产部署配置 (D1 绑定，无敏感明文)
 └── wrangler.toml.example     # 开源示例配置文件
 ```
 

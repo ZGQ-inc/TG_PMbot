@@ -3,7 +3,8 @@ main = "src/entry.py"
 compatibility_date = "2024-04-03"
 compatibility_flags = ["python_workers"]
 
-# Cloudflare KV 命名空间绑定 (请替换为你的 KV ID)
-[[kv_namespaces]]
-binding = "pmbot_captcha"
-id = "<YOUR_KV_NAMESPACE_ID>"
+# Cloudflare D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "pmbot"
+database_id = "你的_D1_DATABASE_ID"

@@ -6,6 +6,7 @@ on:
     paths:
       - 'src/**'
       - 'wrangler.toml'
+      - 'schema.sql'
       - '.github/workflows/deploy-worker.yml'
   workflow_dispatch:
 

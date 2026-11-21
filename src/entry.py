@@ -2,6 +2,7 @@ from workers import Response
 from js import fetch, Object
 from pyodide.ffi import to_js
 import json
+import time
 import random
 import html
 import base64
@@ -57,6 +58,168 @@ def extract_dc_id(file_id: str) -> int | None:
     except Exception:
         return None
 
+def _to_dict(row):
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row
+    try:
+        if hasattr(row, "to_py"):
+            return row.to_py()
+        return dict(row)
+    except Exception:
+        try:
+            return {k: getattr(row, k) for k in dir(row) if not k.startswith("_")}
+        except Exception:
+            return {}
+
+class Database:
+    def __init__(self, d1_binding):
+        self.db = d1_binding
+
+    def _sanitize_params(self, params):
+        return ["" if p is None else p for p in params]
+
+    async def fetch_one(self, sql: str, *params):
+        if not self.db:
+            return None
+        stmt = self.db.prepare(sql)
+        if params:
+            stmt = stmt.bind(*self._sanitize_params(params))
+        row = await stmt.first()
+        return _to_dict(row)
+
+    async def fetch_all(self, sql: str, *params):
+        if not self.db:
+            return []
+        stmt = self.db.prepare(sql)
+        if params:
+            stmt = stmt.bind(*self._sanitize_params(params))
+        res = await stmt.all()
+        results = getattr(res, "results", res)
+        if not results:
+            return []
+        return [_to_dict(r) for r in results if r is not None]
+
+    async def execute(self, sql: str, *params):
+        if not self.db:
+            return None
+        stmt = self.db.prepare(sql)
+        if params:
+            stmt = stmt.bind(*self._sanitize_params(params))
+        return await stmt.run()
+
+    # 1. 消息映射 (messages 表)
+    async def save_message_mapping(self, admin_msg_id: int, user_id: int, user_msg_id: int):
+        now = int(time.time())
+        await self.execute(
+            "INSERT OR REPLACE INTO messages (admin_msg_id, user_id, user_msg_id, created_at) VALUES (?, ?, ?, ?)",
+            admin_msg_id, user_id, user_msg_id, now
+        )
+
+    async def get_message_by_admin_msg_id(self, admin_msg_id: int):
+        now = int(time.time())
+        row = await self.fetch_one(
+            "SELECT user_id, user_msg_id, created_at FROM messages WHERE admin_msg_id = ?",
+            admin_msg_id
+        )
+        if not row:
+            return None
+        if now - row.get("created_at", 0) > 2592000:
+            return None
+        return row
+
+    async def get_admin_msg_id_by_user_msg(self, user_id: int, user_msg_id: int):
+        now = int(time.time())
+        row = await self.fetch_one(
+            "SELECT admin_msg_id, created_at FROM messages WHERE user_id = ? AND user_msg_id = ?",
+            user_id, user_msg_id
+        )
+        if not row:
+            return None
+        if now - row.get("created_at", 0) > 2592000:
+            return None
+        return row.get("admin_msg_id")
+
+    # 2. 访客用户信息与验证状态 (users 表)
+    async def is_user_verified(self, user_id: int) -> bool:
+        row = await self.fetch_one("SELECT is_verified FROM users WHERE user_id = ?", user_id)
+        return bool(row and row.get("is_verified") == 1)
+
+    async def set_user_verified(self, user: dict, dc_id: str):
+        now = int(time.time())
+        user_id = user["id"]
+        first_name = user.get("first_name", "") or ""
+        last_name = user.get("last_name", "") or ""
+        username = user.get("username", "") or ""
+        await self.execute(
+            """INSERT INTO users (user_id, first_name, last_name, username, dc_id, is_verified, verified_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   first_name = excluded.first_name,
+                   last_name = excluded.last_name,
+                   username = excluded.username,
+                   dc_id = excluded.dc_id,
+                   is_verified = 1,
+                   verified_at = excluded.verified_at,
+                   updated_at = excluded.updated_at""",
+            user_id, first_name, last_name, username, dc_id, now, now, now
+        )
+
+    async def get_user_info(self, user_id: int):
+        return await self.fetch_one("SELECT * FROM users WHERE user_id = ?", user_id)
+
+    # 3. 黑名单 (banned_users 表)
+    async def get_ban_info(self, user_id: int):
+        return await self.fetch_one("SELECT reason, banned_at FROM banned_users WHERE user_id = ?", user_id)
+
+    async def ban_user(self, user_id: int, reason: str = ""):
+        now = int(time.time())
+        await self.execute(
+            "INSERT OR REPLACE INTO banned_users (user_id, reason, banned_at) VALUES (?, ?, ?)",
+            user_id, reason or "", now
+        )
+
+    async def unban_user(self, user_id: int):
+        await self.execute("DELETE FROM banned_users WHERE user_id = ?", user_id)
+
+    # 4. 验证码待验证 (pending_captchas 表)
+    async def set_pending_captcha(self, user_id: int, code: str, captcha_msg_id: int | None, original_msg_id: int | None):
+        now = int(time.time())
+        await self.execute(
+            "INSERT OR REPLACE INTO pending_captchas (user_id, code, captcha_msg_id, original_msg_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            user_id, code, captcha_msg_id or 0, original_msg_id or 0, now
+        )
+
+    async def get_pending_captcha(self, user_id: int):
+        now = int(time.time())
+        row = await self.fetch_one(
+            "SELECT code, captcha_msg_id, original_msg_id, created_at FROM pending_captchas WHERE user_id = ?",
+            user_id
+        )
+        if not row:
+            return None
+        if now - row.get("created_at", 0) > 300:
+            await self.execute("DELETE FROM pending_captchas WHERE user_id = ?", user_id)
+            return None
+        return row
+
+    async def delete_pending_captcha(self, user_id: int):
+        await self.execute("DELETE FROM pending_captchas WHERE user_id = ?", user_id)
+
+    # 5. 频控 (rate_limits 表)
+    async def check_rate_limit(self, user_id: int, limit: int = 20, window_sec: int = 60) -> bool:
+        now = int(time.time())
+        row = await self.fetch_one("SELECT count, window_start FROM rate_limits WHERE user_id = ?", user_id)
+        if row and (now - row.get("window_start", 0)) < window_sec:
+            if row.get("count", 0) >= limit:
+                return False
+            await self.execute("UPDATE rate_limits SET count = count + 1 WHERE user_id = ?", user_id)
+            return True
+        else:
+            await self.execute("INSERT OR REPLACE INTO rate_limits (user_id, count, window_start) VALUES (?, 1, ?)", user_id, now)
+            return True
+
 async def tg_request(env, method: str, payload: dict | None = None) -> dict:
     token = env.BOT_TOKEN.strip()
     url = f"https://api.telegram.org/bot{token}/{method}"
@@ -101,16 +264,7 @@ async def get_user_dc(env, user_id: int) -> str:
         print(f"Error getting user DC: {e}")
     return "null"
 
-async def check_rate_limit(env, user_id: int) -> bool:
-    key = f"ratelimit:{user_id}"
-    val = await env.pmbot_captcha.get(key)
-    count = int(val) if val else 0
-    if count >= 20:
-        return False
-    await env.pmbot_captcha.put(key, str(count + 1), expirationTtl=60)
-    return True
-
-async def send_captcha(env, chat_id: int, original_msg_id: int | None = None):
+async def send_captcha(env, db: Database, chat_id: int, original_msg_id: int | None = None):
     code, art = generate_captcha()
     text = (
         "🛡️ <b>请进行人机验证以解锁私聊</b>\n\n"
@@ -126,14 +280,9 @@ async def send_captcha(env, chat_id: int, original_msg_id: int | None = None):
     if res.get("ok"):
         captcha_msg_id = res.get("result", {}).get("message_id")
     
-    pending_data = {
-        "code": code,
-        "captcha_msg_id": captcha_msg_id,
-        "original_msg_id": original_msg_id
-    }
-    await env.pmbot_captcha.put(f"captcha_pending:{chat_id}", json.dumps(pending_data), expirationTtl=300)
+    await db.set_pending_captcha(chat_id, code, captcha_msg_id, original_msg_id)
 
-async def handle_user_verified_banner(env, user: dict, original_msg_id: int | None = None):
+async def handle_user_verified_banner(env, db: Database, user: dict, original_msg_id: int | None = None):
     user_id = user["id"]
     first_name = user.get("first_name", "")
     last_name = user.get("last_name", "")
@@ -143,6 +292,9 @@ async def handle_user_verified_banner(env, user: dict, original_msg_id: int | No
     username = f"@{user['username']}" if user.get("username") else "null"
     uid_display = f"<code>{user_id}</code>"
     dc_display = await get_user_dc(env, user_id)
+
+    # 写入 users 表记录
+    await db.set_user_verified(user, dc_display)
     
     banner_text = (
         "👤 <b>新用户验证通过</b>\n"
@@ -168,16 +320,7 @@ async def handle_user_verified_banner(env, user: dict, original_msg_id: int | No
         if fwd_res.get("ok"):
             admin_msg_id = fwd_res["result"]["message_id"]
             await set_message_reaction(env, user_id, original_msg_id, "👌")
-            await env.pmbot_captcha.put(
-                f"a2u:{admin_msg_id}",
-                json.dumps({"user_id": user_id, "user_msg_id": original_msg_id}),
-                expirationTtl=2592000
-            )
-            await env.pmbot_captcha.put(
-                f"u2a:{user_id}:{original_msg_id}",
-                str(admin_msg_id),
-                expirationTtl=2592000
-            )
+            await db.save_message_mapping(admin_msg_id, user_id, original_msg_id)
 
 async def on_fetch(request, env):
     if request.method != "POST":
@@ -190,12 +333,10 @@ async def on_fetch(request, env):
             incoming_secret = (request.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
             if incoming_secret != webhook_secret:
                 return Response("Unauthorized", status=403)
-
-        raw_body = await request.text()
-        if not raw_body:
-            return Response("Empty body", status=400)
         
-        update = json.loads(raw_body)
+        body_bytes = await request.bytes()
+        update = json.loads(bytes(body_bytes).decode("utf-8"))
+        
         message = update.get("message")
         if not message:
             return Response("OK")
@@ -210,18 +351,24 @@ async def on_fetch(request, env):
         if not sender_id or not chat_id:
             return Response("OK")
         
+        # 初始化 D1 数据库实例
+        db = Database(getattr(env, "DB", None))
+        
         tokens = text.strip().split()
         cmd = tokens[0].split("@")[0].lower() if tokens else ""
 
+        # ==========================================
+        # 管理员业务逻辑分支
+        # ==========================================
         if sender_id == admin_id:
             reply_to = message.get("reply_to_message")
 
             if cmd in ["/start", "/help"]:
                 admin_welcome = (
                     "👋 <b>欢迎回来，主人！</b>\n\n"
-                    "👑 <b>ZGQ_PMbot 管理员面板已就绪</b>\n"
+                    "👑 <b>ZGQ_PMbot 管理员面板已就绪 (Cloudflare D1 驱动)</b>\n"
                     f"• <b>您的 UID:</b> <code>{admin_id}</code>\n"
-                    "• <b>运行环境:</b> Cloudflare Workers (Python Runtime)\n"
+                    "• <b>数据库:</b> Cloudflare D1 SQL (pmbot)\n"
                     "• <b>服务状态:</b> 正常运行中 🟢\n\n"
                     "📖 <b>快捷指令与操作说明:</b>\n"
                     "1. <b>回复用户:</b> 直接【回复】某条用户的转发消息即可，Bot 会自动无引用传递给对方，并带上对原消息的引用。\n"
@@ -242,9 +389,9 @@ async def on_fetch(request, env):
 
                 if reply_to:
                     admin_replied_msg_id = reply_to.get("message_id")
-                    mapping_raw = await env.pmbot_captcha.get(f"a2u:{admin_replied_msg_id}")
-                    if mapping_raw:
-                        target_user_id = json.loads(mapping_raw)["user_id"]
+                    mapping = await db.get_message_by_admin_msg_id(admin_replied_msg_id)
+                    if mapping:
+                        target_user_id = mapping["user_id"]
                         if len(tokens) > 1:
                             reason = " ".join(tokens[1:]).strip()
                 elif len(tokens) > 1 and tokens[1].isdigit():
@@ -261,8 +408,7 @@ async def on_fetch(request, env):
                     })
                     return Response("OK")
 
-                ban_data = {"reason": reason, "user_id": target_user_id}
-                await env.pmbot_captcha.put(f"banned:{target_user_id}", json.dumps(ban_data))
+                await db.ban_user(target_user_id, reason)
 
                 if reason:
                     user_notice = (
@@ -296,9 +442,9 @@ async def on_fetch(request, env):
                 target_user_id = None
                 if reply_to:
                     admin_replied_msg_id = reply_to.get("message_id")
-                    mapping_raw = await env.pmbot_captcha.get(f"a2u:{admin_replied_msg_id}")
-                    if mapping_raw:
-                        target_user_id = json.loads(mapping_raw)["user_id"]
+                    mapping = await db.get_message_by_admin_msg_id(admin_replied_msg_id)
+                    if mapping:
+                        target_user_id = mapping["user_id"]
                 elif len(tokens) > 1 and tokens[1].isdigit():
                     target_user_id = int(tokens[1])
 
@@ -311,7 +457,7 @@ async def on_fetch(request, env):
                     })
                     return Response("OK")
 
-                await env.pmbot_captcha.delete(f"banned:{target_user_id}")
+                await db.unban_user(target_user_id)
 
                 try:
                     await tg_request(env, "sendMessage", {
@@ -341,8 +487,8 @@ async def on_fetch(request, env):
                     return Response("OK")
                 
                 admin_replied_msg_id = reply_to.get("message_id")
-                mapping_raw = await env.pmbot_captcha.get(f"a2u:{admin_replied_msg_id}")
-                if not mapping_raw:
+                mapping = await db.get_message_by_admin_msg_id(admin_replied_msg_id)
+                if not mapping:
                     await tg_request(env, "sendMessage", {
                         "chat_id": admin_id,
                         "text": "⚠️ 未找到该消息的用户映射记录或已过期（超过30天）。",
@@ -350,10 +496,11 @@ async def on_fetch(request, env):
                     })
                     return Response("OK")
                 
-                target_user_id = json.loads(mapping_raw)["user_id"]
-                is_ver = await env.pmbot_captcha.get(f"verified:{target_user_id}")
-                is_ban = await env.pmbot_captcha.get(f"banned:{target_user_id}")
-                dc_info = await get_user_dc(env, target_user_id)
+                target_user_id = mapping["user_id"]
+                u_db = await db.get_user_info(target_user_id)
+                is_ver = await db.is_user_verified(target_user_id)
+                ban_info = await db.get_ban_info(target_user_id)
+                dc_info = u_db.get("dc_id") if (u_db and u_db.get("dc_id")) else await get_user_dc(env, target_user_id)
                 
                 u_chat = await tg_request(env, "getChat", {"chat_id": target_user_id})
                 u_res = u_chat.get("result", {}) if u_chat.get("ok") else {}
@@ -361,7 +508,7 @@ async def on_fetch(request, env):
                 u_uname = f"@{u_res['username']}" if u_res.get("username") else "null"
                 
                 ver_status = "已验证 ✅" if is_ver else "未验证 ⏳"
-                ban_status = "已封禁 🚫" if is_ban else "正常 🟢"
+                ban_status = f"已封禁 🚫 ({html.escape(ban_info['reason'])})" if (ban_info and ban_info.get("reason")) else ("已封禁 🚫" if ban_info else "正常 🟢")
                 
                 info_card = (
                     "📋 <b>用户详情信息</b>\n\n"
@@ -380,6 +527,7 @@ async def on_fetch(request, env):
                 })
                 return Response("OK")
 
+            # 管理员回复用户消息
             if not reply_to:
                 await tg_request(env, "sendMessage", {
                     "chat_id": admin_id,
@@ -389,8 +537,8 @@ async def on_fetch(request, env):
                 return Response("OK")
             
             admin_replied_msg_id = reply_to.get("message_id")
-            mapping_raw = await env.pmbot_captcha.get(f"a2u:{admin_replied_msg_id}")
-            if not mapping_raw:
+            mapping = await db.get_message_by_admin_msg_id(admin_replied_msg_id)
+            if not mapping:
                 await tg_request(env, "sendMessage", {
                     "chat_id": admin_id,
                     "text": "⚠️ 未找到对应的用户会话或消息映射已过期（超过30天），无法送达。",
@@ -398,7 +546,6 @@ async def on_fetch(request, env):
                 })
                 return Response("OK")
             
-            mapping = json.loads(mapping_raw)
             target_user_id = mapping["user_id"]
             target_user_msg_id = mapping["user_msg_id"]
             
@@ -415,16 +562,7 @@ async def on_fetch(request, env):
             if copy_res.get("ok"):
                 delivered_user_msg_id = copy_res["result"]["message_id"]
                 await set_message_reaction(env, admin_id, msg_id, "👌")
-                await env.pmbot_captcha.put(
-                    f"a2u:{msg_id}",
-                    json.dumps({"user_id": target_user_id, "user_msg_id": delivered_user_msg_id}),
-                    expirationTtl=2592000
-                )
-                await env.pmbot_captcha.put(
-                    f"u2a:{target_user_id}:{delivered_user_msg_id}",
-                    str(msg_id),
-                    expirationTtl=2592000
-                )
+                await db.save_message_mapping(msg_id, target_user_id, delivered_user_msg_id)
             else:
                 desc = copy_res.get("description", "")
                 err_code = copy_res.get("error_code")
@@ -449,11 +587,13 @@ async def on_fetch(request, env):
             
             return Response("OK")
 
-        banned_raw = await env.pmbot_captcha.get(f"banned:{sender_id}")
-        if banned_raw:
+        # ==========================================
+        # 访客业务逻辑分支
+        # ==========================================
+        ban_info = await db.get_ban_info(sender_id)
+        if ban_info:
             if cmd == "/start":
-                banned_data = json.loads(banned_raw) if banned_raw != "true" else {}
-                r = banned_data.get("reason")
+                r = ban_info.get("reason")
                 if r:
                     t = f"🚫 您已被封禁，无法使用此机器人。\n<b>原因:</b> {html.escape(r)}"
                 else:
@@ -465,7 +605,7 @@ async def on_fetch(request, env):
                 })
             return Response("OK")
 
-        if not await check_rate_limit(env, sender_id):
+        if not await db.check_rate_limit(sender_id):
             await tg_request(env, "sendMessage", {
                 "chat_id": sender_id,
                 "text": "⚠️ <b>发送过于频繁</b>，请稍候再试。",
@@ -491,28 +631,27 @@ async def on_fetch(request, env):
             })
             return Response("OK")
 
-        is_verified = await env.pmbot_captcha.get(f"verified:{sender_id}")
+        is_verified = await db.is_user_verified(sender_id)
         
         if not is_verified:
             if cmd == "/start":
-                await send_captcha(env, sender_id, None)
+                await send_captcha(env, db, sender_id, None)
                 return Response("OK")
 
-            pending_raw = await env.pmbot_captcha.get(f"captcha_pending:{sender_id}")
-            if pending_raw:
-                pending = json.loads(pending_raw)
-                expected_code = pending.get("code")
+            pending = await db.get_pending_captcha(sender_id)
+            if pending:
+                expected_code = str(pending.get("code", "")).strip()
                 cleaned_input = text.strip()
                 
                 if cleaned_input == expected_code:
-                    await env.pmbot_captcha.put(f"verified:{sender_id}", "true")
-                    await env.pmbot_captcha.delete(f"captcha_pending:{sender_id}")
+                    await db.delete_pending_captcha(sender_id)
                     
-                    if pending.get("captcha_msg_id"):
+                    captcha_msg_id = pending.get("captcha_msg_id")
+                    if captcha_msg_id:
                         try:
                             await tg_request(env, "deleteMessage", {
                                 "chat_id": sender_id,
-                                "message_id": pending["captcha_msg_id"]
+                                "message_id": captcha_msg_id
                             })
                         except Exception:
                             pass
@@ -526,7 +665,9 @@ async def on_fetch(request, env):
                     })
                     
                     orig_id = pending.get("original_msg_id")
-                    await handle_user_verified_banner(env, from_user, orig_id)
+                    if orig_id == 0:
+                        orig_id = None
+                    await handle_user_verified_banner(env, db, from_user, orig_id)
                     return Response("OK")
                 else:
                     await tg_request(env, "sendMessage", {
@@ -536,7 +677,7 @@ async def on_fetch(request, env):
                     })
                     return Response("OK")
             
-            await send_captcha(env, sender_id, msg_id)
+            await send_captcha(env, db, sender_id, msg_id)
             return Response("OK")
         
         if cmd == "/start":
@@ -561,17 +702,7 @@ async def on_fetch(request, env):
         if fwd_res.get("ok"):
             admin_msg_id = fwd_res["result"]["message_id"]
             await set_message_reaction(env, sender_id, msg_id, "👌")
-            
-            await env.pmbot_captcha.put(
-                f"a2u:{admin_msg_id}",
-                json.dumps({"user_id": sender_id, "user_msg_id": msg_id}),
-                expirationTtl=2592000
-            )
-            await env.pmbot_captcha.put(
-                f"u2a:{sender_id}:{msg_id}",
-                str(admin_msg_id),
-                expirationTtl=2592000
-            )
+            await db.save_message_mapping(admin_msg_id, sender_id, msg_id)
             
         return Response("OK")
         
