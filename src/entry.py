@@ -196,18 +196,34 @@ class Database:
     async def delete_pending_captcha(self, user_id: int):
         await self.execute("DELETE FROM pending_captchas WHERE user_id = ?", user_id)
 
+    async def touch_user(self, user: dict):
+        now = int(time.time())
+        user_id = user.get("id")
+        if not user_id:
+            return
+        first_name = user.get("first_name", "") or ""
+        last_name = user.get("last_name", "") or ""
+        username = user.get("username", "") or ""
+        await self.execute(
+            "UPDATE users SET first_name = ?, last_name = ?, username = ?, updated_at = ? WHERE user_id = ?",
+            first_name, last_name, username, now, user_id
+        )
+
     # 5. 频控 (rate_limits 表)
-    async def check_rate_limit(self, user_id: int, limit: int = 20, window_sec: int = 60) -> bool:
+    async def check_rate_limit(self, user_id: int, limit: int = 20, window_sec: int = 60) -> tuple[bool, bool]:
         now = int(time.time())
         row = await self.fetch_one("SELECT count, window_start FROM rate_limits WHERE user_id = ?", user_id)
         if row and (now - row.get("window_start", 0)) < window_sec:
-            if row.get("count", 0) >= limit:
-                return False
+            current_count = row.get("count", 0)
+            if current_count >= limit:
+                await self.execute("UPDATE rate_limits SET count = count + 1 WHERE user_id = ?", user_id)
+                should_notify = (current_count == limit)
+                return False, should_notify
             await self.execute("UPDATE rate_limits SET count = count + 1 WHERE user_id = ?", user_id)
-            return True
+            return True, False
         else:
             await self.execute("INSERT OR REPLACE INTO rate_limits (user_id, count, window_start) VALUES (?, 1, ?)", user_id, now)
-            return True
+            return True, False
 
 async def tg_request(env, method: str, payload: dict | None = None) -> dict:
     token = env.BOT_TOKEN.strip()
@@ -334,7 +350,7 @@ async def on_fetch(request, env):
         sender_id = from_user.get("id")
         chat_id = message.get("chat", {}).get("id")
         msg_id = message.get("message_id")
-        text = message.get("text", "") or ""
+        text = message.get("text", "") or message.get("caption", "") or ""
         admin_id = int(str(env.ADMIN_UID).strip())
         
         if not sender_id or not chat_id:
@@ -363,7 +379,7 @@ async def on_fetch(request, env):
                     "1. <b>回复用户:</b> 直接【回复】某条用户的转发消息即可，Bot 会自动无引用传递给对方，并带上对原消息的引用。\n"
                     "2. <b>封禁用户:</b> 回复消息输入 <code>/ban [理由]</code>，或输入 <code>/ban &lt;UID&gt; [理由]</code>。\n"
                     "3. <b>解封用户:</b> 回复消息输入 <code>/unban</code>，或输入 <code>/unban &lt;UID&gt;</code>。\n"
-                    "4. <b>查看名片:</b> 回复消息输入 <code>/info</code> 随时调取该用户的资料与头像 DC 节点。"
+                    "4. <b>查看名片:</b> 回复消息输入 <code>/info</code>，或直接输入 <code>/info &lt;UID&gt;</code> 随时调取该用户的资料与头像 DC 节点。"
                 )
                 await tg_request(env, "sendMessage", {
                     "chat_id": admin_id,
@@ -383,7 +399,8 @@ async def on_fetch(request, env):
                         target_user_id = mapping["user_id"]
                         if len(tokens) > 1:
                             reason = " ".join(tokens[1:]).strip()
-                elif len(tokens) > 1 and tokens[1].isdigit():
+
+                if not target_user_id and len(tokens) > 1 and tokens[1].isdigit():
                     target_user_id = int(tokens[1])
                     if len(tokens) > 2:
                         reason = " ".join(tokens[2:]).strip()
@@ -434,7 +451,8 @@ async def on_fetch(request, env):
                     mapping = await db.get_message_by_admin_msg_id(admin_replied_msg_id)
                     if mapping:
                         target_user_id = mapping["user_id"]
-                elif len(tokens) > 1 and tokens[1].isdigit():
+
+                if not target_user_id and len(tokens) > 1 and tokens[1].isdigit():
                     target_user_id = int(tokens[1])
 
                 if not target_user_id:
@@ -466,26 +484,23 @@ async def on_fetch(request, env):
                 return Response("OK")
 
             if cmd == "/info":
-                if not reply_to:
+                target_user_id = None
+                if reply_to:
+                    admin_replied_msg_id = reply_to.get("message_id")
+                    mapping = await db.get_message_by_admin_msg_id(admin_replied_msg_id)
+                    if mapping:
+                        target_user_id = mapping["user_id"]
+                elif len(tokens) > 1 and tokens[1].isdigit():
+                    target_user_id = int(tokens[1])
+
+                if not target_user_id:
                     await tg_request(env, "sendMessage", {
                         "chat_id": admin_id,
-                        "text": "💡 请直接【回复】某条用户的消息并发送 <code>/info</code> 查看该用户详情。",
+                        "text": "💡 <b>用法说明</b>：请【回复】某条用户的转发消息发送 <code>/info</code>，或直接输入 <code>/info &lt;UID&gt;</code> 查看用户详情。",
                         "parse_mode": "HTML",
                         "reply_parameters": {"message_id": msg_id}
                     })
                     return Response("OK")
-                
-                admin_replied_msg_id = reply_to.get("message_id")
-                mapping = await db.get_message_by_admin_msg_id(admin_replied_msg_id)
-                if not mapping:
-                    await tg_request(env, "sendMessage", {
-                        "chat_id": admin_id,
-                        "text": "⚠️ 未找到该消息的用户映射记录，无法获取目标用户。",
-                        "reply_parameters": {"message_id": msg_id}
-                    })
-                    return Response("OK")
-                
-                target_user_id = mapping["user_id"]
                 u_db = await db.get_user_info(target_user_id)
                 is_ver = await db.is_user_verified(target_user_id)
                 ban_info = await db.get_ban_info(target_user_id)
@@ -594,12 +609,14 @@ async def on_fetch(request, env):
                 })
             return Response("OK")
 
-        if not await db.check_rate_limit(sender_id):
-            await tg_request(env, "sendMessage", {
-                "chat_id": sender_id,
-                "text": "⚠️ <b>发送过于频繁</b>，请稍候再试。",
-                "parse_mode": "HTML"
-            })
+        allowed, should_notify = await db.check_rate_limit(sender_id)
+        if not allowed:
+            if should_notify:
+                await tg_request(env, "sendMessage", {
+                    "chat_id": sender_id,
+                    "text": "⚠️ <b>发送过于频繁</b>，请稍候再试。",
+                    "parse_mode": "HTML"
+                })
             return Response("OK")
 
         if cmd in ["/ban", "/unban", "/info"]:
@@ -692,6 +709,7 @@ async def on_fetch(request, env):
             admin_msg_id = fwd_res["result"]["message_id"]
             await set_message_reaction(env, sender_id, msg_id, "👌")
             await db.save_message_mapping(admin_msg_id, sender_id, msg_id)
+            await db.touch_user(from_user)
             
         return Response("OK")
         
