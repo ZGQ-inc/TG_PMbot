@@ -118,28 +118,17 @@ class Database:
         )
 
     async def get_message_by_admin_msg_id(self, admin_msg_id: int):
-        now = int(time.time())
-        row = await self.fetch_one(
+        return await self.fetch_one(
             "SELECT user_id, user_msg_id, created_at FROM messages WHERE admin_msg_id = ?",
             admin_msg_id
         )
-        if not row:
-            return None
-        if now - row.get("created_at", 0) > 2592000:
-            return None
-        return row
 
     async def get_admin_msg_id_by_user_msg(self, user_id: int, user_msg_id: int):
-        now = int(time.time())
         row = await self.fetch_one(
             "SELECT admin_msg_id, created_at FROM messages WHERE user_id = ? AND user_msg_id = ?",
             user_id, user_msg_id
         )
-        if not row:
-            return None
-        if now - row.get("created_at", 0) > 2592000:
-            return None
-        return row.get("admin_msg_id")
+        return row.get("admin_msg_id") if row else None
 
     # 2. 访客用户信息与验证状态 (users 表)
     async def is_user_verified(self, user_id: int) -> bool:
@@ -491,7 +480,7 @@ async def on_fetch(request, env):
                 if not mapping:
                     await tg_request(env, "sendMessage", {
                         "chat_id": admin_id,
-                        "text": "⚠️ 未找到该消息的用户映射记录或已过期（超过30天）。",
+                        "text": "⚠️ 未找到该消息的用户映射记录，无法获取目标用户。",
                         "reply_parameters": {"message_id": msg_id}
                     })
                     return Response("OK")
@@ -541,7 +530,7 @@ async def on_fetch(request, env):
             if not mapping:
                 await tg_request(env, "sendMessage", {
                     "chat_id": admin_id,
-                    "text": "⚠️ 未找到对应的用户会话或消息映射已过期（超过30天），无法送达。",
+                    "text": "⚠️ 未找到对应的用户会话或消息映射记录，无法送达。",
                     "reply_parameters": {"message_id": msg_id}
                 })
                 return Response("OK")
